@@ -37,8 +37,17 @@ export const useTransferLearning = () => {
         setError(null);
 
         try {
-            // 1. Load YAMNet for Feature Extraction
-            const yamnet = await tf.loadGraphModel(MODEL_URL, { fromTFHub: true });
+            // 1. Load YAMNet (Optimized: Check Cache First)
+            let yamnet: tf.GraphModel;
+            try {
+                yamnet = await tf.loadGraphModel('indexeddb://yamnet-model');
+                console.log('TransferLearning: Loaded from Cache');
+            } catch {
+                console.log('TransferLearning: Cache miss, downloading...');
+                yamnet = await tf.loadGraphModel(MODEL_URL, { fromTFHub: true });
+                // Attempt save for next time
+                try { await yamnet.save('indexeddb://yamnet-model'); } catch { }
+            }
 
             // 2. Prepare Data
             const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -46,59 +55,56 @@ export const useTransferLearning = () => {
             const gunshotEmbeddings: number[][] = [];
             const chainsawEmbeddings: number[][] = [];
 
-            // Helper to process a category
+            // Helper to process a category concurrently
             const processCategory = async (files: File[], targetArray: number[][]) => {
-                for (const file of files) {
+                // Process all files in parallel
+                const promises = files.map(async (file) => {
                     const waveform = await processAudioFile(file, audioContext);
-                    if (waveform) {
-                        // Extract chunks
-                        for (let i = 0; i + YAMNET_INPUT_SIZE <= waveform.length; i += YAMNET_INPUT_SIZE) {
-                            const chunk = waveform.subarray(i, i + YAMNET_INPUT_SIZE);
+                    if (!waveform) return;
 
-                            tf.tidy(() => {
-                                const tensor = tf.tensor1d(chunk, 'float32');
-                                const [, embeddings] = yamnet.predict(tensor) as tf.Tensor[];
+                    // Extract chunks
+                    for (let i = 0; i + YAMNET_INPUT_SIZE <= waveform.length; i += YAMNET_INPUT_SIZE) {
+                        const chunk = waveform.subarray(i, i + YAMNET_INPUT_SIZE);
 
-                                if (embeddings) {
-                                    const embedData = embeddings.dataSync(); // Float32Array
-                                    // Normalize embedding logic? YAMNet embeddings are not normalized.
-                                    // Cosine similarity requires normalization or manual division.
-                                    // Let's store raw and normalize during comparison, or normalize here.
-                                    // Let's normalize here to save compute later.
+                        tf.tidy(() => {
+                            const tensor = tf.tensor1d(chunk, 'float32');
+                            const [, embeddings] = yamnet.predict(tensor) as tf.Tensor[];
 
-                                    // Shape [N, 1024]
-                                    const numFrames = embedData.length / 1024;
-                                    if (numFrames > 1) {
-                                        // Average pooling
-                                        const avgEmbed = new Float32Array(1024);
-                                        for (let f = 0; f < numFrames; f++) {
-                                            for (let k = 0; k < 1024; k++) {
-                                                avgEmbed[k] += embedData[f * 1024 + k];
-                                            }
+                            if (embeddings) {
+                                const embedData = embeddings.dataSync(); // Float32Array
+
+                                // Shape [N, 1024]
+                                const numFrames = embedData.length / 1024;
+                                if (numFrames > 1) {
+                                    // Average pooling
+                                    const avgEmbed = new Float32Array(1024);
+                                    for (let f = 0; f < numFrames; f++) {
+                                        for (let k = 0; k < 1024; k++) {
+                                            avgEmbed[k] += embedData[f * 1024 + k];
                                         }
-                                        for (let k = 0; k < 1024; k++) avgEmbed[k] /= numFrames;
-
-                                        // L2 Normalize
-                                        const norm = Math.sqrt(avgEmbed.reduce((sum, val) => sum + val * val, 0));
-                                        if (norm > 0) for (let k = 0; k < 1024; k++) avgEmbed[k] /= norm;
-
-                                        targetArray.push(Array.from(avgEmbed));
-                                    } else {
-                                        const singleEmbed = new Float32Array(embedData);
-                                        // L2 Normalize
-                                        const norm = Math.sqrt(singleEmbed.reduce((sum, val) => sum + val * val, 0));
-                                        if (norm > 0) for (let k = 0; k < 1024; k++) singleEmbed[k] /= norm;
-
-                                        targetArray.push(Array.from(singleEmbed));
                                     }
+                                    for (let k = 0; k < 1024; k++) avgEmbed[k] /= numFrames;
+
+                                    // L2 Normalize
+                                    const norm = Math.sqrt(avgEmbed.reduce((sum, val) => sum + val * val, 0));
+                                    if (norm > 0) for (let k = 0; k < 1024; k++) avgEmbed[k] /= norm;
+
+                                    targetArray.push(Array.from(avgEmbed));
+                                } else {
+                                    const singleEmbed = new Float32Array(embedData);
+                                    // L2 Normalize
+                                    const norm = Math.sqrt(singleEmbed.reduce((sum, val) => sum + val * val, 0));
+                                    if (norm > 0) for (let k = 0; k < 1024; k++) singleEmbed[k] /= norm;
+
+                                    targetArray.push(Array.from(singleEmbed));
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
-                }
+                });
+
+                await Promise.all(promises);
             };
-
-
 
             await processCategory(dataset.gunshots, gunshotEmbeddings);
             setProgress(50);
@@ -106,7 +112,13 @@ export const useTransferLearning = () => {
             await processCategory(dataset.chainsaws, chainsawEmbeddings);
             setProgress(100);
 
-            if (gunshotEmbeddings.length === 0 && chainsawEmbeddings.length === 0) throw new Error("No features extracted.");
+            if (gunshotEmbeddings.length === 0 && chainsawEmbeddings.length === 0) {
+                // Even if no features, we shouldn't crash unless NO files were provided.
+                // If files provided but no features, maybe silence.
+                if (dataset.gunshots.length > 0 || dataset.chainsaws.length > 0) {
+                    console.warn("Files provided but no features extracted.");
+                }
+            }
 
             const enrolled = {
                 gunshots: gunshotEmbeddings,

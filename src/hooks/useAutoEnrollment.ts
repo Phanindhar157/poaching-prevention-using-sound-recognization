@@ -13,10 +13,16 @@ export const useAutoEnrollment = () => {
 
     useEffect(() => {
         const loadDataset = async () => {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
+
             try {
                 setIsLoadingManifest(true);
-                // 1. Fetch Manifest
-                const response = await fetch('/dataset/manifest.json');
+                // 1. Fetch Manifest (Timeout after 3s)
+
+                const response = await fetch('/dataset/manifest.json', { signal: controller.signal });
+                clearTimeout(timeoutId);
+
                 if (!response.ok) throw new Error('Failed to load dataset manifest.');
 
                 const manifest: Manifest = await response.json();
@@ -27,8 +33,6 @@ export const useAutoEnrollment = () => {
                     if (typeof manifest.gunshots[0] === 'string') {
                         fileList = manifest.gunshots as string[];
                     } else if (typeof manifest.gunshots[0] === 'object') {
-                        // Fallback for the PowerShell object case (just in case)
-                        // Fallback for the PowerShell object case (just in case)
                         fileList = (manifest.gunshots as Array<{ Name?: string; value?: string } | string>).map(f => {
                             if (typeof f === 'string') return f;
                             return f.Name || f.value || String(f);
@@ -49,7 +53,6 @@ export const useAutoEnrollment = () => {
                 for (let i = 0; i < fileList.length; i += BATCH_SIZE) {
                     const chunk = fileList.slice(i, i + BATCH_SIZE);
                     const chunkPromises = chunk.map(async (filename) => {
-                        // Clean filename if needed (sometimes path enters)
                         const name = filename.split(/[/\\]/).pop();
                         try {
                             const res = await fetch(`/dataset/gunshots/${filename}`);
@@ -65,7 +68,6 @@ export const useAutoEnrollment = () => {
                     const chunkFiles = await Promise.all(chunkPromises);
                     loadedFiles.push(...(chunkFiles.filter(f => f !== null) as File[]));
 
-                    // Update progress (0-50% for fetching, 50-100% is enrollment)
                     const currentProgress = Math.round((i / fileList.length) * 50);
                     setFetchProgress(currentProgress);
                 }
@@ -83,9 +85,15 @@ export const useAutoEnrollment = () => {
 
             } catch (err) {
                 console.error("Auto-enrollment error:", err);
-                setAutoLoadError(String(err));
+                // Only show error if it's NOT an abort error (which is expected if network is down/no manifest)
+                if (err instanceof Error && err.name === 'AbortError') {
+                    console.log("Auto-enrollment timed out (no manifest found?). Skipping.");
+                } else {
+                    setAutoLoadError(String(err));
+                }
             } finally {
                 setIsLoadingManifest(false);
+                clearTimeout(timeoutId);
             }
         };
 

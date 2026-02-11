@@ -9,4 +9,6 @@ export interface AudioClassifierState {
   error: string | null;
   results: ClassificationResult[];
   volume?: number;
+  distance?: number;
+  direction?: number;
 }
